@@ -7,6 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+use crate::agent::loop_::run_tool_call_loop;
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -290,6 +291,12 @@ pub struct AppState {
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    /// Security policy for tool execution
+    pub security: Arc<SecurityPolicy>,
+    /// Runtime adapter for tool execution
+    pub runtime: Arc<dyn runtime::RuntimeAdapter>,
+    /// Tools registry for agent tool execution
+    pub tools_registry: Arc<Vec<Box<dyn tools::Tool>>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -350,10 +357,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
-        runtime,
+        runtime.clone(),
         Arc::clone(&mem),
         composio_key,
         composio_entity_id,
@@ -568,6 +575,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
         observer,
+        security,
+        runtime,
+        tools_registry,
     };
 
     // Build router with middleware
@@ -759,6 +769,59 @@ async fn run_gateway_chat_with_multimodal(
         .await
 }
 
+/// Run gateway chat with full tool execution support (like normal channels).
+/// This replaces `run_gateway_chat_with_multimodal` for endpoints that need tool support.
+async fn run_gateway_tool_loop(state: &AppState, provider_label: &str, message: &str) -> anyhow::Result<String> {
+    // Extract tool names and descriptions for the system prompt
+    let tools: Vec<(&str, &str)> = state
+        .tools_registry
+        .iter()
+        .map(|tool| (tool.name(), tool.description()))
+        .collect();
+
+    // Build system prompt with workspace context AND tools
+    let system_prompt = {
+        let config_guard = state.config.lock();
+        crate::channels::build_system_prompt(
+            &config_guard.workspace_dir,
+            &state.model,
+            &tools,
+            &[], // skills
+            Some(&config_guard.identity),
+            None, // bootstrap_max_chars - use default
+        )
+    };
+
+    // Build initial message history with system prompt and user message
+    let mut history = vec![
+        ChatMessage::system(system_prompt),
+        ChatMessage::user(message),
+    ];
+
+    // Get multimodal config from state
+    let multimodal_config = state.config.lock().multimodal.clone();
+    let max_tool_iterations = state.config.lock().agent.max_tool_iterations;
+
+    // Run the tool call loop - this will execute tools and return only the final text response
+    run_tool_call_loop(
+        state.provider.as_ref(),
+        &mut history,
+        state.tools_registry.as_ref(),
+        state.observer.as_ref(),
+        provider_label,
+        &state.model,
+        state.temperature,
+        true, // silent - no extra output
+        None, // approval - not used for gateway
+        "gateway",
+        &multimodal_config,
+        max_tool_iterations,
+        None, // cancellation_token
+        None, // on_delta - no streaming support in gateway yet
+    )
+    .await
+}
+
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
@@ -880,7 +943,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message).await {
+    match run_gateway_tool_loop(&state, &provider_label, message).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -1086,7 +1149,7 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        match run_gateway_tool_loop(&state, &provider_label, &msg.content).await {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -1199,8 +1262,8 @@ async fn handle_linq_webhook(
                 .await;
         }
 
-        // Call the LLM
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        // Call the LLM with tool support
+        match run_gateway_tool_loop(&state, &provider_label, &msg.content).await {
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq
@@ -1354,6 +1417,95 @@ mod tests {
         hex::encode(bytes)
     }
 
+    /// Create a minimal `AppState` for tests, including new tool support fields.
+    fn test_app_state() -> AppState {
+        let config = Config::default();
+        let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::new(MockRuntime);
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let tools_registry: Arc<Vec<Box<dyn tools::Tool>>> = Arc::new(vec![]);
+        AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            security,
+            runtime,
+            tools_registry,
+        }
+    }
+
+    /// Override specific fields in a test `AppState`.
+    fn test_app_state_with_observer(observer: Arc<dyn crate::observability::Observer>) -> AppState {
+        let mut state = test_app_state();
+        state.observer = observer;
+        state
+    }
+
+    /// Create a test `AppState` with custom provider and memory.
+    fn test_app_state_with_provider_and_memory(
+        provider: Arc<dyn Provider>,
+        memory: Arc<dyn Memory>,
+    ) -> AppState {
+        let config = Config::default();
+        let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::new(MockRuntime);
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let tools_registry: Arc<Vec<Box<dyn tools::Tool>>> = Arc::new(vec![]);
+        AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            security,
+            runtime,
+            tools_registry,
+        }
+    }
+
+    /// Create a test `AppState` with custom provider, memory, and webhook secret hash.
+    fn test_app_state_with_provider_memory_and_secret(
+        provider: Arc<dyn Provider>,
+        memory: Arc<dyn Memory>,
+        webhook_secret_hash: Option<Arc<str>>,
+    ) -> AppState {
+        let mut state = test_app_state_with_provider_and_memory(provider, memory);
+        state.webhook_secret_hash = webhook_secret_hash;
+        state
+    }
+
     #[test]
     fn security_body_limit_is_64kb() {
         assert_eq!(MAX_BODY_SIZE, 65_536);
@@ -1394,26 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider: Arc::new(MockProvider::default()),
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: Arc::new(MockMemory),
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-        };
+        let state = test_app_state();
 
         let response = handle_metrics(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1438,27 +1571,7 @@ mod tests {
             &crate::observability::ObserverEvent::HeartbeatTick,
         );
 
-        let observer: Arc<dyn crate::observability::Observer> = prom;
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider: Arc::new(MockProvider::default()),
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: Arc::new(MockMemory),
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            observer,
-        };
+        let state = test_app_state_with_observer(prom);
 
         let response = handle_metrics(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1735,6 +1848,39 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct MockRuntime;
+
+    impl runtime::RuntimeAdapter for MockRuntime {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn has_shell_access(&self) -> bool {
+            false
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            false
+        }
+
+        fn storage_path(&self) -> std::path::PathBuf {
+            std::path::PathBuf::from("/tmp/mock-runtime")
+        }
+
+        fn supports_long_running(&self) -> bool {
+            false
+        }
+
+        fn build_shell_command(
+            &self,
+            _command: &str,
+            _workspace_dir: &std::path::Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            anyhow::bail!("MockRuntime does not support shell commands")
+        }
+    }
+
+    #[derive(Default)]
     struct TrackingMemory {
         keys: Mutex<Vec<String>>,
     }
@@ -1801,26 +1947,7 @@ mod tests {
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-        };
+        let state = test_app_state_with_provider_and_memory(provider, memory);
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
@@ -1861,26 +1988,8 @@ mod tests {
         let tracking_impl = Arc::new(TrackingMemory::default());
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: true,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-        };
+        let mut state = test_app_state_with_provider_and_memory(provider, memory);
+        state.auto_save = true;
 
         let headers = HeaderMap::new();
 
@@ -1933,26 +2042,11 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
 
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+        let state = test_app_state_with_provider_memory_and_secret(
             provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-        };
+            memory,
+            Some(Arc::from(hash_webhook_secret(&secret))),
+        );
 
         let response = handle_webhook(
             State(state),
@@ -1977,26 +2071,11 @@ mod tests {
         let valid_secret = generate_test_secret();
         let wrong_secret = generate_test_secret();
 
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+        let state = test_app_state_with_provider_memory_and_secret(
             provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-        };
+            memory,
+            Some(Arc::from(hash_webhook_secret(&valid_secret))),
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2026,26 +2105,11 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
 
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+        let state = test_app_state_with_provider_memory_and_secret(
             provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-        };
+            memory,
+            Some(Arc::from(hash_webhook_secret(&secret))),
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
