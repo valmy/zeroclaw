@@ -779,6 +779,13 @@ async fn run_gateway_tool_loop(state: &AppState, provider_label: &str, message: 
         .map(|tool| (tool.name(), tool.description()))
         .collect();
 
+    tracing::debug!(
+        "[gateway-tool-loop] tools_registry size: {}, extracted tools: {}, provider: {}",
+        state.tools_registry.len(),
+        tools.len(),
+        provider_label
+    );
+
     // Build system prompt with workspace context AND tools
     let system_prompt = {
         let config_guard = state.config.lock();
@@ -792,6 +799,12 @@ async fn run_gateway_tool_loop(state: &AppState, provider_label: &str, message: 
         )
     };
 
+    tracing::debug!(
+        "[gateway-tool-loop] system_prompt length: {}, contains 'Tools' section: {}",
+        system_prompt.len(),
+        system_prompt.contains("## Tools")
+    );
+
     // Build initial message history with system prompt and user message
     let mut history = vec![
         ChatMessage::system(system_prompt),
@@ -802,8 +815,15 @@ async fn run_gateway_tool_loop(state: &AppState, provider_label: &str, message: 
     let multimodal_config = state.config.lock().multimodal.clone();
     let max_tool_iterations = state.config.lock().agent.max_tool_iterations;
 
+    // Check provider capabilities
+    let supports_native = state.provider.supports_native_tools();
+    tracing::debug!(
+        "[gateway-tool-loop] provider supports_native_tools: {}",
+        supports_native
+    );
+
     // Run the tool call loop - this will execute tools and return only the final text response
-    run_tool_call_loop(
+    let result = run_tool_call_loop(
         state.provider.as_ref(),
         &mut history,
         state.tools_registry.as_ref(),
@@ -819,7 +839,14 @@ async fn run_gateway_tool_loop(state: &AppState, provider_label: &str, message: 
         None, // cancellation_token
         None, // on_delta - no streaming support in gateway yet
     )
-    .await
+    .await;
+
+    tracing::debug!(
+        "[gateway-tool-loop] run_tool_call_loop result: {}",
+        if result.is_ok() { "OK" } else { "ERR" }
+    );
+
+    result
 }
 
 /// Webhook request body
