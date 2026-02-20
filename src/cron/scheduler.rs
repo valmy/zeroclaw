@@ -522,6 +522,7 @@ mod tests {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
+            default_provider: Some("__test_nonexistent_provider__".to_string()),
             ..Config::default()
         };
         tokio::fs::create_dir_all(&config.workspace_dir)

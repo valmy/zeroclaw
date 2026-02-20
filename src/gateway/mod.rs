@@ -771,7 +771,11 @@ async fn run_gateway_chat_with_multimodal(
 
 /// Run gateway chat with full tool execution support (like normal channels).
 /// This replaces `run_gateway_chat_with_multimodal` for endpoints that need tool support.
-async fn run_gateway_tool_loop(state: &AppState, provider_label: &str, message: &str) -> anyhow::Result<String> {
+async fn run_gateway_tool_loop(
+    state: &AppState,
+    provider_label: &str,
+    message: &str,
+) -> anyhow::Result<String> {
     // Extract tool names and descriptions for the system prompt
     let tools: Vec<(&str, &str)> = state
         .tools_registry
@@ -2190,6 +2194,12 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            runtime: Arc::new(MockRuntime),
+            security: Arc::new(SecurityPolicy::from_config(
+                &Config::default().autonomy,
+                &Config::default().workspace_dir,
+            )),
+            tools_registry: Arc::new(vec![]),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2240,6 +2250,12 @@ mod tests {
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
+            runtime: Arc::new(MockRuntime),
+            security: Arc::new(SecurityPolicy::from_config(
+                &Config::default().autonomy,
+                &Config::default().workspace_dir,
+            )),
+            tools_registry: Arc::new(vec![]),
         };
 
         let mut headers = HeaderMap::new();
